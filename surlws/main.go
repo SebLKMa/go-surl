@@ -1,0 +1,263 @@
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/gorilla/mux"
+
+	db "src/github.com/seblkma/go-surl/surldb"
+	dm "src/github.com/seblkma/go-surl/surldm"
+	ut "src/github.com/seblkma/go-surl/surlut"
+)
+
+// DB connection used in this file
+var surl_dbconn db.DbConnection
+var surl_db *sql.DB
+
+func init() {
+	c, err := db.GetConnectionFromEnv()
+	if err != nil {
+		panic(err)
+	}
+	surl_dbconn = c
+}
+
+type ErrorResponse struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+type SuccessResponse struct {
+	Code int         `json:"code"`
+	Data interface{} `json:"data"`
+}
+
+func notImplemented(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, "Not implement yet", http.StatusNotImplemented)
+}
+
+func ping(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte("pong\n"))
+}
+
+func setSurl(w http.ResponseWriter, r *http.Request) {
+	var src dm.SurlId
+	err := json.NewDecoder(r.Body).Decode(&src)
+	if err != nil {
+		errmsg := err.Error()
+		fmt.Println(errmsg)
+		w.WriteHeader(http.StatusBadRequest)
+		er := ErrorResponse{Code: http.StatusBadRequest, Message: "JSON input error: " + errmsg}
+		json.NewEncoder(w).Encode(er)
+		return
+	}
+
+	fmt.Printf("src: %#v\n", src)
+	longUrl := src.LongUrl
+	if surl_db == nil {
+		errmsg := "DB error"
+		fmt.Println(errmsg)
+		w.WriteHeader(http.StatusInternalServerError)
+		er := ErrorResponse{Code: http.StatusInternalServerError, Message: errmsg}
+		json.NewEncoder(w).Encode(er)
+		return
+	}
+
+	_, err = db.GetSurlIdByLongUrl(surl_db, longUrl)
+	if err != nil {
+		// not found, generate unique id for new record
+		src.UniqueID = ut.GenId(longUrl)
+		if src.UniqueID == "" {
+			errmsg := "Error generating short id"
+			fmt.Println(errmsg)
+			w.WriteHeader(http.StatusInternalServerError)
+			er := ErrorResponse{Code: http.StatusInternalServerError, Message: errmsg}
+			json.NewEncoder(w).Encode(er)
+			return
+		}
+		src.ShortUrl = "https://go/" + src.UniqueID
+		src.ExpiresOn = time.Now().AddDate(2, 0, 0) // expires in 2 years
+	}
+
+	err = db.CreateOrUpdateSurlId(surl_db, src)
+	if err != nil {
+		errmsg := err.Error()
+		fmt.Println(errmsg)
+		w.WriteHeader(http.StatusInternalServerError)
+		er := ErrorResponse{Code: http.StatusInternalServerError, Message: errmsg}
+		json.NewEncoder(w).Encode(er)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func getSurlByLongUrl(w http.ResponseWriter, r *http.Request) {
+	// By query param
+	key := r.URL.Query().Get("longurl")
+	if key == "" {
+		// note: if they pass in like ?param1=&param2= param1 will also be ""
+		//fmt.Fprintf(w, "missing query param: sourcepath\n")
+		w.WriteHeader(http.StatusBadRequest)
+		er := ErrorResponse{Code: http.StatusBadRequest, Message: "missing query param: longurl"}
+		json.NewEncoder(w).Encode(er)
+		return
+	}
+
+	result, err := db.GetSurlIdByLongUrl(surl_db, key)
+	if err != nil {
+		errMsg := fmt.Sprintf("%s - %s\n", err.Error(), key)
+		fmt.Println(errMsg)
+		w.WriteHeader(http.StatusNotFound)
+		er := ErrorResponse{Code: http.StatusNotFound, Message: errMsg}
+		json.NewEncoder(w).Encode(er)
+		return
+	}
+
+	fmt.Printf("%#v\n", result)
+
+	err = json.NewEncoder(w).Encode(result)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func getSurlByShortUrl(w http.ResponseWriter, r *http.Request) {
+	// By query param
+	/*
+		key := r.URL.Query().Get("shorturl")
+	*/
+
+	// By json struct
+	var src dm.InputString
+	err := json.NewDecoder(r.Body).Decode(&src)
+	if err != nil {
+		errmsg := err.Error()
+		fmt.Println(errmsg)
+		w.WriteHeader(http.StatusBadRequest)
+		er := ErrorResponse{Code: http.StatusBadRequest, Message: "JSON input error: " + errmsg}
+		json.NewEncoder(w).Encode(er)
+		return
+	}
+	key := src.Input
+	if key == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		er := ErrorResponse{Code: http.StatusBadRequest, Message: "missing input key"}
+		json.NewEncoder(w).Encode(er)
+		return
+	}
+
+	result, err := db.GetSurlIdByShortUrl(surl_db, key)
+	if err != nil {
+		errMsg := fmt.Sprintf("%s - %s\n", err.Error(), key)
+		fmt.Println(errMsg)
+		w.WriteHeader(http.StatusNotFound)
+		er := ErrorResponse{Code: http.StatusNotFound, Message: errMsg}
+		json.NewEncoder(w).Encode(er)
+		return
+	}
+
+	fmt.Printf("%#v\n", result)
+
+	err = json.NewEncoder(w).Encode(result)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func visitByShortUrl(w http.ResponseWriter, r *http.Request) {
+	// FYI
+	// https://www.stackhawk.com/blog/golang-open-redirect-guide-examples-and-prevention/
+	// https://labex.io/tutorials/go-how-to-implement-effective-http-redirects-in-go-435277
+	// https://labex.io/tutorials/go-how-to-design-http-request-handlers-450884
+
+	// By query param
+	key := r.URL.Query().Get("shorturl")
+
+	// By json string not possible in browser
+	/*
+		var src dm.InputString
+		err := json.NewDecoder(r.Body).Decode(&src)
+		if err != nil {
+			errmsg := err.Error()
+			fmt.Println(errmsg)
+			w.WriteHeader(http.StatusBadRequest)
+			er := ErrorResponse{Code: http.StatusBadRequest, Message: "JSON input error: " + errmsg}
+			json.NewEncoder(w).Encode(er)
+			return
+		}
+		key := src.Input
+	*/
+	if key == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		er := ErrorResponse{Code: http.StatusBadRequest, Message: "missing input key"}
+		json.NewEncoder(w).Encode(er)
+		return
+	}
+
+	result, err := db.GetSurlIdByShortUrl(surl_db, key)
+	if err != nil {
+		errMsg := fmt.Sprintf("%s - %s\n", err.Error(), key)
+		fmt.Println(errMsg)
+		w.WriteHeader(http.StatusNotFound)
+		er := ErrorResponse{Code: http.StatusNotFound, Message: errMsg}
+		json.NewEncoder(w).Encode(er)
+		return
+	}
+
+	fmt.Printf("%#v\n", result)
+
+	http.Redirect(w, r, result.LongUrl, http.StatusFound)
+}
+
+const Port = "port"
+
+func main() {
+
+	surl_db = surl_dbconn.Connect()
+	defer surl_db.Close()
+
+	if surl_db == nil {
+		fmt.Println("DB connection error")
+		os.Exit(1)
+	}
+
+	surl_db.Ping()
+
+	portFlag := flag.String(Port, "8181", "The HTTP Port. Default is 8181.")
+	flag.Parse()
+	port := *portFlag
+	myRouter := mux.NewRouter().StrictSlash(true)
+
+	// curl -X GET localhost:8282/ping
+	myRouter.HandleFunc("/ping", ping).Methods("GET")
+
+	// curl -X POST localhost:8282/setsurl -d '{"LongUrl":"https://github.com/ardanlabs/gotraining/blob/master/topics/go/design/composition/README.md"}'
+	myRouter.HandleFunc("/setsurl", setSurl).Methods("POST")
+
+	// curl -X GET localhost:8282/getsurlbylongurl?longurl=https://github.com/ardanlabs/gotraining/blob/master/topics/go/design/composition/README.md
+	myRouter.HandleFunc("/getsurlbylongurl", getSurlByLongUrl).Methods("GET")
+	// By query param, curl -X GET localhost:8282/getsurlbyshorturl?shorturl=https://go/23bn0CGuIfB
+	// By json, curl -X GET localhost:8282/getsurlbyshorturl -d '{"Input": "https://go/23bn0CGuIfB"}'
+	myRouter.HandleFunc("/getsurlbyshorturl", getSurlByShortUrl).Methods("GET")
+	// curl -X GET localhost:8282/visitbyshorturl?shorturl=https://go/23bn0CGuIfB
+	// OR just paste to browser -> localhost:8282/visitbyshorturl?shorturl=https://go/23bn0CGuIfB
+	myRouter.HandleFunc("/visitbyshorturl", visitByShortUrl).Methods("GET")
+
+	host := "0.0.0.0:" + port
+	fmt.Println(host + " up and listening")
+
+	log.Fatal(http.ListenAndServe(host, myRouter))
+
+}
